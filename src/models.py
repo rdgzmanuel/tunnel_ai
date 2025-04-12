@@ -6,7 +6,7 @@ class LSTMForecast(nn.Module):
     """
     Baseline LSTM model for tunnel temperature prediction.
     """
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_horizon: int) -> None:
+    def __init__(self, input_size: int, hidden_size: int, dropout: float, num_layers: int, output_horizon: int) -> None:
         """
         Args:
             input_size (int): Number of spatial points used as input features.
@@ -17,7 +17,7 @@ class LSTMForecast(nn.Module):
         super().__init__()
 
         self.lstm: nn.LSTM = nn.LSTM(input_size=input_size, hidden_size=hidden_size,
-                                     num_layers=num_layers, batch_first=True)
+                                     num_layers=num_layers, dropout=dropout, batch_first=True)
         self.fc: nn.Linear = nn.Linear(hidden_size, input_size * output_horizon)
         self.output_horizon: int = output_horizon
         self.input_size: int = input_size

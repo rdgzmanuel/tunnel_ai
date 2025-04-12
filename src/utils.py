@@ -3,11 +3,12 @@ import os
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.jit import RecursiveScriptModule
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
+# T0099.csv
 
 class TunnelTemperatureDataset(Dataset):
     """
@@ -18,59 +19,97 @@ class TunnelTemperatureDataset(Dataset):
     def __init__(self, csv_folder: str, history: int = 30, horizon: int = 10, spatial_stride: int = 1) -> None:
         """
         Args:
-            csv_folder (str): Path to folder with CSV files.
+            csv_folder (str): Path to main data folder containing subfolders with "T0099.csv".
             history (int): Number of past seconds to use as input.
             horizon (int): Number of seconds into the future to predict.
             spatial_stride (int): Downsampling factor for spatial resolution.
         """
-        self.csv_folder: str = csv_folder
-        self.history: int = history
-        self.horizon: int = horizon
-        self.spatial_stride: int = spatial_stride
+        self.csv_folder = csv_folder
+        self.history = history
+        self.horizon = horizon
+        self.spatial_stride = spatial_stride
 
-        self.files: list[str] = [os.path.join(csv_folder, f) for f in os.listdir(csv_folder) if f.endswith(".csv")]
-        self.simulations: list[np.ndarray] = [np.loadtxt(f, delimiter=",")[:, ::spatial_stride] for f in self.files]
+        self.simulations = []
+        self.samples = []
 
-        self.total_time_steps: int = self.simulations[0].shape[0]  # assuming all same length
-        self.num_points: int = self.simulations[0].shape[1]
+        print(f"Looking for CSV files in: {csv_folder}")
 
-        self.samples: list[tuple[int, int]] = []
+        # Traverse subdirectories to find all "T0099.csv"
+        for root, _, files in os.walk(csv_folder):
+            for file in files:
+                if file == "T0099.csv":
+                    full_path = os.path.join(root, file)
+                    print(f"Found: {full_path}")
+
+                    try:
+                        data = np.loadtxt(full_path, delimiter=",", dtype=np.float32)
+                    except Exception as e:
+                        print(f"Error reading {full_path}: {e}")
+                        continue
+
+                    # Ensure shape and remove first column if needed
+                    if data.shape[1] > 1501:
+                        data = data[:, :1501]
+                    data = data[:, 1:]  # remove first column (e.g., time)
+
+                    if data.shape[1] == 1500:
+                        downsampled_data = data[:, ::spatial_stride]
+                        self.simulations.append(downsampled_data)
+                        print(f"Loaded simulation with shape: {downsampled_data.shape}")
+                    else:
+                        print(f"Skipping {full_path}: unexpected number of columns ({data.shape[1]})")
+
+        if not self.simulations:
+            raise RuntimeError("No valid simulations found with 1500 spatial points.")
+
+        self.total_time_steps = self.simulations[0].shape[0]
+        self.num_points = self.simulations[0].shape[1]
+
         for sim_idx, sim in enumerate(self.simulations):
             for t in range(self.total_time_steps - history - horizon):
                 self.samples.append((sim_idx, t))
 
-    def __len__(self) -> int:
+        print(f"Total simulations loaded: {len(self.simulations)}")
+        print(f"Total samples generated: {len(self.samples)}")
+
+    def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx):
         sim_idx, t = self.samples[idx]
-        sim: np.ndarray = self.simulations[sim_idx]
+        sim = self.simulations[sim_idx]
 
-        x: np.ndarray = sim[t : t + self.history]
-        y: np.ndarray = sim[t + self.history : t + self.history + self.horizon]
+        x = sim[t : t + self.history]
+        y = sim[t + self.history : t + self.history + self.horizon]
+
+        # Debug print to verify shapes
+        if x.shape != (self.history, self.num_points) or y.shape != (self.horizon, self.num_points):
+            print(f"Warning: Unexpected shape at idx {idx} (sim {sim_idx}, t={t})")
+            print(f"x shape: {x.shape}, expected: ({self.history}, {self.num_points})")
+            print(f"y shape: {y.shape}, expected: ({self.horizon}, {self.num_points})")
 
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
 
 def get_dataloaders(
-    csv_path: str,
+    csvs_path: str,
     batch_size: int,
     history: int,
     horizon: int,
     spatial_stride: int,
     num_workers: int = 4
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    dataset: TunnelTemperatureDataset = TunnelTemperatureDataset(csv_path, history, horizon, spatial_stride)
-
+    dataset: TunnelTemperatureDataset = TunnelTemperatureDataset(csvs_path, history, horizon, spatial_stride)
+    print("dataset", len(dataset))
     train_size: int = int(0.8 * len(dataset))
     val_size: int = int(0.1 * len(dataset))
     test_size: int = len(dataset) - train_size - val_size
 
     train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
 
-    train_loader: DataLoader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader: DataLoader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    test_loader: DataLoader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    train_loader: DataLoader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    val_loader: DataLoader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
+    test_loader: DataLoader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
 
     return train_loader, val_loader, test_loader
 
@@ -127,7 +166,7 @@ def load_model(name: str) -> RecursiveScriptModule:
     Returns:
         RecursiveScriptModule: model in torchscript.
     """
-    model_path: str = f"/workspace/project/models/{name}.pt"
+    model_path: str = f"/{name}.pt"
 
     if not os.path.exists(model_path):
         model_path = f"models/{name}.pt"
@@ -211,3 +250,41 @@ def load_tensorboard_scalars(model_dir: str, metric: str) -> tuple[list[int], li
     values: list[float] = [e.value for e in events]
     
     return steps, values
+
+class RegressionMetrics:
+    """
+    Tracks MSE, MAE, and R² score for regression tasks.
+    """
+
+    def __init__(self) -> None:
+        self.y_true: list[float] = []
+        self.y_pred: list[float] = []
+
+
+    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None:
+        """
+        Stores predictions and targets for later evaluation.
+
+        Args:
+            preds (torch.Tensor): Predicted values.
+            targets (torch.Tensor): Ground truth values.
+        """
+        self.y_true.extend(targets.detach().cpu().flatten().tolist())
+        self.y_pred.extend(preds.detach().cpu().flatten().tolist())
+
+    def compute(self) -> dict[str, float]:
+        """
+        Computes the regression metrics.
+
+        Returns:
+            dict: Dictionary with MSE, MAE, and R².
+        """
+        mse: float = mean_squared_error(self.y_true, self.y_pred)
+        mae: float = mean_absolute_error(self.y_true, self.y_pred)
+        r2: float = r2_score(self.y_true, self.y_pred)
+        return {"mse": mse, "mae": mae, "r2": r2}
+
+    def reset(self) -> None:
+        """Clears stored predictions and labels."""
+        self.y_true: list[float] = []
+        self.y_pred: list[float] = []
