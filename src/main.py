@@ -1,5 +1,5 @@
 import os
-import matplotlib.pyplot as plt
+
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -11,7 +11,11 @@ from src.utils import (
     get_dataloaders,
     save_model,
     set_seed,
-    RegressionMetrics
+    RegressionMetrics,
+    plot_logs,
+    plot_prediction,
+    load_model,
+    generate_forecast_video
 )
 
 device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -22,9 +26,11 @@ CSV_DATA_PATH: str = "data/"
 MODEL_NAME: str = "lstm_baseline"
 LOG_DIR: str = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
+PLOT_DIR: str = "plots"
+os.makedirs(PLOT_DIR, exist_ok=True)
 
 # Model & training hyperparameters
-epochs: int = 5
+epochs: int = 1
 learning_rate: float = 1e-2
 batch_size: int = 16
 history: int = 30
@@ -44,13 +50,16 @@ val_logs: dict[str, list[float]] = {"loss": [], "mse": [], "r2": []}
 def main() -> None:
     global train_logs, val_logs
 
-    train_loader, val_loader, test_loader = get_dataloaders(
+    train_loader, val_loader, test_loader, simulation = get_dataloaders(
         csvs_path=CSV_DATA_PATH,
         batch_size=batch_size,
         history=history,
         horizon=horizon,
         spatial_stride=spatial_stride
     )
+
+    global_mean: float = float(np.load(os.path.join(LOG_DIR, "global_mean.npy")))
+    global_std: float = float(np.load(os.path.join(LOG_DIR, "global_std.npy")))
 
     input_size: int = next(iter(train_loader))[0].shape[-1]
 
@@ -59,7 +68,6 @@ def main() -> None:
         hidden_size=hidden_size,
         dropout=dropout,
         num_layers=num_layers,
-        output_horizon=horizon
     ).to(device)
 
     criterion: torch.nn.Module = torch.nn.MSELoss()
@@ -69,14 +77,25 @@ def main() -> None:
 
     for epoch in tqdm(range(epochs)):
         train_loss: float = train_step(model, train_loader, criterion, optimizer, epoch)
-        val_loss: float = val_step(model, val_loader, criterion, epoch)
+        val_loss: float = val_step(model, val_loader, criterion, epoch, global_mean, global_std)
         scheduler.step(val_loss)
 
     save_model(model, MODEL_NAME)
-    plot_logs()
+    plot_logs(train_logs, val_logs, LOG_DIR)
     results: dict[str, float] = test_step(model, test_loader, device)
 
     print(f"[Test Results] | MSE: {results['mse']:.4f} | MAE: {results['mae']:.4f} | R²: {results['r2']:.4f}")
+
+    # Generate video
+    generate_forecast_video(
+        model=model,
+        sim_data=simulation,
+        history=30,
+        horizon=10,
+        global_mean=global_mean,
+        global_std=global_std,
+        save_path="plots/forecast_video.gif",
+    )
 
 
 def train_step(
@@ -120,14 +139,16 @@ def val_step(
     model: torch.nn.Module,
     loader: DataLoader,
     loss_fn: torch.nn.Module,
-    epoch: int
+    epoch: int,
+    global_mean: float,
+    global_std: float
 ) -> float:
     model.eval()
     losses: list[float] = []
     metrics: RegressionMetrics = RegressionMetrics()
 
     with torch.no_grad():
-        for x, y in loader:
+        for i, (x, y) in enumerate(loader):
             x = x.to(device)
             y = y.to(device)
 
@@ -136,6 +157,18 @@ def val_step(
 
             metrics.update(y_hat, y)
             losses.append(loss.item())
+
+            # if i % 5 == 0:
+            #     plot_prediction(
+            #         y_true=y[0],
+            #         y_pred=y_hat[0],
+            #         epoch=epoch,
+            #         plot_dir=PLOT_DIR,
+            #         batch_idx=i,
+            #         global_mean=global_mean,
+            #         global_std=global_std,
+            #         original_input=x[0],
+            #     )
 
     avg_loss: float = float(np.mean(losses))
     results: dict[str, float] = metrics.compute()
@@ -165,26 +198,6 @@ def test_step(
             metrics.update(y_hat, y)
 
     return metrics.compute()
-
-
-def plot_logs() -> None:
-    def _plot(metrics: dict[str, list[float]], title: str, filename: str) -> None:
-        fig, axs = plt.subplots(1, 3, figsize=(18, 4))
-        keys: list[str] = ["loss", "mse", "r2"]
-
-        for i, key in enumerate(keys):
-            axs[i].plot(metrics[key], marker="o")
-            axs[i].set_title(f"{title} {key.upper()}")
-            axs[i].set_xlabel("Epoch")
-            axs[i].set_ylabel(key.upper())
-            axs[i].grid(True)
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(LOG_DIR, filename))
-        plt.close()
-
-    _plot(train_logs, "Train", "train.png")
-    _plot(val_logs, "Validation", "val.png")
 
 
 if __name__ == "__main__":

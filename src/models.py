@@ -1,43 +1,36 @@
 import torch
 import torch.nn as nn
 
-
 class LSTMForecast(nn.Module):
     """
-    Baseline LSTM model for tunnel temperature prediction.
+    LSTM model for predicting temperature (or delta) at a single horizon point.
+    Uses mean-pooling over time instead of just the last hidden state.
     """
-    def __init__(self, input_size: int, hidden_size: int, dropout: float, num_layers: int, output_horizon: int) -> None:
-        """
-        Args:
-            input_size (int): Number of spatial points used as input features.
-            hidden_size (int): Number of hidden units in LSTM.
-            num_layers (int): Number of stacked LSTM layers.
-            output_horizon (int): Number of future time steps to predict.
-        """
-        super().__init__()
 
-        self.lstm: nn.LSTM = nn.LSTM(input_size=input_size, hidden_size=hidden_size,
-                                     num_layers=num_layers, dropout=dropout, batch_first=True)
-        self.fc: nn.Linear = nn.Linear(hidden_size, input_size * output_horizon)
-        self.output_horizon: int = output_horizon
+    def __init__(self, input_size: int, hidden_size: int, dropout: float, num_layers: int) -> None:
+        super().__init__()
+        self.lstm: nn.LSTM = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.fc: nn.Linear = nn.Linear(hidden_size, input_size)
         self.input_size: int = input_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass.
-
         Args:
-            x (Tensor): Input tensor of shape [batch, time, spatial_points]
+            x (torch.Tensor): Shape [batch, history, spatial_points]
 
         Returns:
-            Tensor: Output tensor of shape [batch, horizon, spatial_points]
+            torch.Tensor: Shape [batch, spatial_points]
         """
-        _, (hn, _) = self.lstm(x)  # Take hidden state from last layer
-        hn_last: torch.Tensor = hn[-1]  # shape: [batch, hidden_size]
-        out: torch.Tensor = self.fc(hn_last)  # shape: [batch, horizon * spatial_points]
-        out = out.view(-1, self.output_horizon, self.input_size)
+        lstm_out, _ = self.lstm(x)  # lstm_out: [batch, history, hidden_size]
+        pooled: torch.Tensor = lstm_out.mean(dim=1)  # Mean pooling over time
+        out: torch.Tensor = self.fc(pooled)
         return out
-
 
 class TCNBlock(nn.Module):
     """
